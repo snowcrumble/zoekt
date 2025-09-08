@@ -50,6 +50,8 @@ func main() {
 	deleteRepos := flag.Bool("delete", false, "delete missing repos")
 	excludeUserRepos := flag.Bool("exclude_user", false, "exclude user repos")
 	namePattern := flag.String("name", "", "only clone repos whose name matches the given regexp.")
+	groups := flag.String("groups", "", "only clone repos whose in these groups, seperated by comma.")
+	projectIds := flag.String("project_ids", "", "only clone repos whose in these projectIds, seperated by comma.")
 	excludePattern := flag.String("exclude", "", "don't mirror repos whose names match this regexp.")
 	lastActivityAfter := flag.String("last_activity_after", "", "only mirror repos that have been active since this date (format: 2006-01-02).")
 	noArchived := flag.Bool("no_archived", false, "mirror only projects that are not archived")
@@ -83,6 +85,42 @@ func main() {
 		log.Fatal(err)
 	}
 
+	var gitlabProjects []*gitlab.Project
+	if *groups != "" {
+		gitlabProjects = append(gitlabProjects,
+			getProjectsByGroups(*groups, isPublic, lastActivityAfter, noArchived, client, excludeUserRepos)...)
+	}
+	if *projectIds != "" {
+		gitlabProjects = append(gitlabProjects,
+			getProjectsByProjectIds(*projectIds, client, excludeUserRepos)...)
+	}
+	if *namePattern != "" {
+		gitlabProjects = append(gitlabProjects,
+			getProjectsByProjects(isMember, isPublic, lastActivityAfter, noArchived, client, excludeUserRepos)...)
+	}
+
+	filter, err := gitindex.NewFilter(*namePattern, *excludePattern)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	trimmed := gitlabProjects[:0]
+	for _, p := range gitlabProjects {
+		if filter.Include(p.PathWithNamespace) {
+			trimmed = append(trimmed, p)
+		}
+	}
+	gitlabProjects = trimmed
+	fetchProjects(destDir, apiToken, gitlabProjects)
+
+	if *deleteRepos {
+		if err := deleteStaleProjects(*dest, filter, gitlabProjects); err != nil {
+			log.Fatalf("deleteStaleProjects: %v", err)
+		}
+	}
+}
+
+func getProjectsByProjects(isMember *bool, isPublic *bool, lastActivityAfter *string, noArchived *bool, client *gitlab.Client, excludeUserRepos *bool) []*gitlab.Project {
 	opt := &gitlab.ListProjectsOptions{
 		ListOptions: gitlab.ListOptions{
 			PerPage: 100,
@@ -134,28 +172,79 @@ func main() {
 
 		opt.IDAfter = &projects[len(projects)-1].ID
 	}
+	return gitlabProjects
+}
 
-	filter, err := gitindex.NewFilter(*namePattern, *excludePattern)
-	if err != nil {
-		log.Fatal(err)
+func getProjectsByProjectIds(projectIds string, client *gitlab.Client, excludeUserRepos *bool) []*gitlab.Project {
+	opt := &gitlab.GetProjectOptions{}
+	var gitlabProjects []*gitlab.Project
+	for _, pid := range strings.Split(projectIds, ",") {
+		project, _, err := client.Projects.GetProject(pid, opt)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		// Skip projects without a default branch - these should be projects
+		// where the repository isn't enabled
+		if project.DefaultBranch == "" {
+			continue
+		}
+		if *excludeUserRepos && project.Namespace.Kind == "user" {
+			continue
+		}
+
+		gitlabProjects = append(gitlabProjects, project)
+	}
+	return gitlabProjects
+}
+
+func getProjectsByGroups(groups string, isPublic *bool, lastActivityAfter *string, noArchived *bool, client *gitlab.Client, excludeUserRepos *bool) []*gitlab.Project {
+	opt := &gitlab.ListGroupProjectsOptions{
+		ListOptions: gitlab.ListOptions{
+			PerPage: 100,
+		},
+		Sort:             gitlab.Ptr("asc"),
+		OrderBy:          gitlab.Ptr("id"),
+		IncludeSubGroups: gitlab.Ptr(true),
+	}
+	if *isPublic {
+		opt.Visibility = gitlab.Ptr(gitlab.PublicVisibility)
 	}
 
-	{
-		trimmed := gitlabProjects[:0]
-		for _, p := range gitlabProjects {
-			if filter.Include(p.NameWithNamespace) {
-				trimmed = append(trimmed, p)
+	if *noArchived {
+		opt.Archived = gitlab.Ptr(false)
+	}
+
+	var gitlabProjects []*gitlab.Project
+	for _, group := range strings.Split(groups, ",") {
+		for opt.ListOptions.Page = 0; ; opt.ListOptions.Page++ {
+			projects, _, err := client.Groups.ListGroupProjects(group, opt)
+			if err != nil {
+				log.Println(err)
+				break
 			}
-		}
-		gitlabProjects = trimmed
-	}
-	fetchProjects(destDir, apiToken, gitlabProjects)
+			if len(projects) == 0 {
+				break
+			}
 
-	if *deleteRepos {
-		if err := deleteStaleProjects(*dest, filter, gitlabProjects); err != nil {
-			log.Fatalf("deleteStaleProjects: %v", err)
+			for _, project := range projects {
+
+				// Skip projects without a default branch - these should be projects
+				// where the repository isn't enabled
+				if project.DefaultBranch == "" {
+					continue
+				}
+				if *excludeUserRepos && project.Namespace.Kind == "user" {
+					continue
+				}
+
+				gitlabProjects = append(gitlabProjects, project)
+			}
+
 		}
 	}
+	return gitlabProjects
 }
 
 func deleteStaleProjects(destDir string, filter *gitindex.Filter, projects []*gitlab.Project) error {
@@ -201,7 +290,7 @@ func fetchProjects(destDir, token string, projects []*gitlab.Project) {
 			"zoekt.public":   marshalBool(p.Visibility == gitlab.PublicVisibility),
 		}
 
-		cloneURL := p.HTTPURLToRepo
+		cloneURL := p.SSHURLToRepo
 		dest, err := gitindex.CloneRepo(destDir, p.PathWithNamespace, cloneURL, config)
 		if err != nil {
 			log.Printf("cloneRepos: %v", err)

@@ -42,6 +42,8 @@ type ConfigEntry struct {
 	CredentialPath         string
 	ProjectType            string
 	Name                   string
+	Groups                 string
+	ProjectIds             string
 	Exclude                string
 	GitLabURL              string
 	OnlyPublic             bool
@@ -244,6 +246,12 @@ func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- string
 				"-dest", repoDir, "-url", c.GitLabURL)
 			if c.Name != "" {
 				cmd.Args = append(cmd.Args, "-name", c.Name)
+			}
+			if c.Groups != "" {
+				cmd.Args = append(cmd.Args, "-groups", c.Groups)
+			}
+			if c.ProjectIds != "" {
+				cmd.Args = append(cmd.Args, "-project_ids", c.ProjectIds)
 			}
 			if c.Exclude != "" {
 				cmd.Args = append(cmd.Args, "-exclude", c.Exclude)
